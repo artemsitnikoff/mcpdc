@@ -1,0 +1,25 @@
+# Virtualenvs / caches
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# VCS and editor metadata
+.git/
+.gitignore
+.vscode/
+.idea/
+.claude/
+
+# Secrets must NOT be baked into image layers — compose mounts .env at runtime.
+.env
+.env.*
+!.env.example
+
+# Local-only artifacts
+*.log
+.DS_Store
