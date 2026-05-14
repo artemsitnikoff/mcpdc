@@ -7,7 +7,6 @@ from typing import AsyncGenerator
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from mcp.server.sse import SseServerTransport
-from starlette.routing import Mount
 
 from .client import ConfluenceClient
 from .config import get_settings
@@ -65,9 +64,11 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=503, detail="Service not initialized")
         try:
             is_healthy = await confluence_client.health_check()
-        except Exception as e:
-            logger.error(f"Health check failed: {e}")
-            raise HTTPException(status_code=503, detail=f"Health check failed: {e}")
+        except Exception:
+            # Don't leak exception details to clients — /healthz is typically
+            # public (Docker healthcheck, k8s probe). The full trace goes to logs.
+            logger.exception("Health check failed")
+            raise HTTPException(status_code=503, detail="Confluence unreachable")
         if not is_healthy:
             raise HTTPException(status_code=503, detail="Confluence unreachable")
         return {"status": "healthy", "confluence": "connected"}

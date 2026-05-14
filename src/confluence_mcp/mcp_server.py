@@ -5,7 +5,6 @@ import logging
 from mcp.server import Server
 
 from .client import ConfluenceClient
-from .config import settings
 from .tools import register_all_tools, ALL_TOOLS
 
 logger = logging.getLogger(__name__)

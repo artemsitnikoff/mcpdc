@@ -1,6 +1,5 @@
 """Page tools for Confluence MCP server."""
 
-import json
 import logging
 from typing import Any, Dict, List
 
@@ -217,7 +216,10 @@ def register_page_tools(server: Server, confluence: ConfluenceClient) -> None:
                     text="Error: 'id' is required"
                 )]
 
-            if not new_title and not new_content:
+            # `is None` instead of falsy check so that `content=""` (intentional
+            # clear) is honored as an update rather than silently substituted
+            # with the current value.
+            if new_title is None and new_content is None:
                 return [TextContent(
                     type="text",
                     text="Error: At least one of 'title' or 'content' must be provided"
@@ -229,15 +231,18 @@ def register_page_tools(server: Server, confluence: ConfluenceClient) -> None:
                 expand="body.storage,space,version"
             )
 
-            # Prepare update data
             update_data = {
                 "id": page_id,
                 "type": "page",
-                "title": new_title or current_page["title"],
+                "title": new_title if new_title is not None else current_page["title"],
                 "space": {"key": current_page["space"]["key"]},
                 "body": {
                     "storage": {
-                        "value": new_content or current_page["body"]["storage"]["value"],
+                        "value": (
+                            new_content
+                            if new_content is not None
+                            else current_page["body"]["storage"]["value"]
+                        ),
                         "representation": "storage",
                     }
                 },
@@ -425,10 +430,6 @@ PAGE_TOOLS = [
                     "default": True,
                 },
             },
-            "anyOf": [
-                {"required": ["id"]},
-                {"required": ["space_key", "title"]},
-            ],
         },
     ),
     Tool(

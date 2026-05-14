@@ -72,11 +72,3 @@ def get_settings(validate_required: bool = True) -> Settings:
     if validate_required and not os.getenv("PYTEST_CURRENT_TEST"):
         settings.validate_required_fields()
     return settings
-
-
-# Global settings instance for backwards compatibility
-try:
-    settings = get_settings()
-except ValueError:
-    # In test environment or missing config
-    settings = Settings()

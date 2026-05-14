@@ -1,27 +1,30 @@
 """Tests for FastAPI application."""
 
+from unittest.mock import AsyncMock
+
 import pytest
 from fastapi.testclient import TestClient
-import httpx
 
 from confluence_mcp.app import create_app
 
 
 class TestFastAPIApp:
-    """Test FastAPI application."""
+    """Test FastAPI application.
+
+    The TestClient is used *without* `with` on purpose: that keeps the lifespan
+    from running so `app.state.confluence_client` stays unset and we can drive
+    the /healthz branches deterministically without ever touching the network.
+    """
 
     @pytest.fixture
     def app(self):
-        """Create FastAPI app for testing."""
         return create_app()
 
     @pytest.fixture
     def client(self, app):
-        """Create test client."""
         return TestClient(app)
 
     def test_root_endpoint(self, client):
-        """Test root endpoint."""
         response = client.get("/")
 
         assert response.status_code == 200
@@ -30,17 +33,59 @@ class TestFastAPIApp:
         assert "endpoints" in data
         assert "/healthz" in data["endpoints"]["health"]
 
-    @pytest.mark.asyncio
-    async def test_health_endpoint_without_confluence(self, client):
-        """Test health endpoint when Confluence client not initialized."""
+    def test_health_endpoint_returns_503_when_state_not_initialized(self, app, client):
+        """Lifespan didn't run → no confluence_client on state → 503."""
+        # Sanity check: state must not have a client (we deliberately skipped lifespan).
+        assert not hasattr(app.state, "confluence_client")
+
+        response = client.get("/healthz")
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Service not initialized"
+
+    def test_health_endpoint_does_not_leak_exception_details(self, app, client):
+        """When health_check raises, the response detail must be a constant.
+
+        Regression: a previous version returned f"Health check failed: {e}",
+        which leaks httpx/Confluence error text — potentially URLs, credentials
+        baked into URLs, or CAPTCHA-lock hints — to any caller of /healthz.
+        """
+        fake = AsyncMock()
+        fake.health_check = AsyncMock(
+            side_effect=RuntimeError("boom: https://user:pw@confluence/internal")
+        )
+        app.state.confluence_client = fake
+
         response = client.get("/healthz")
 
-        # Should fail because confluence client is not initialized in test
         assert response.status_code == 503
-        assert "Service not initialized" in response.json()["detail"]
+        body = response.text
+        # The constant detail is exposed…
+        assert response.json()["detail"] == "Confluence unreachable"
+        # …and nothing from the underlying exception leaks through.
+        assert "boom" not in body
+        assert "user:pw" not in body
+        assert "internal" not in body
+
+    def test_health_endpoint_returns_503_when_health_check_returns_false(self, app, client):
+        fake = AsyncMock()
+        fake.health_check = AsyncMock(return_value=False)
+        app.state.confluence_client = fake
+
+        response = client.get("/healthz")
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Confluence unreachable"
+
+    def test_health_endpoint_returns_200_when_healthy(self, app, client):
+        fake = AsyncMock()
+        fake.health_check = AsyncMock(return_value=True)
+        app.state.confluence_client = fake
+
+        response = client.get("/healthz")
+        assert response.status_code == 200
+        assert response.json() == {"status": "healthy", "confluence": "connected"}
 
     def test_sse_route_registered(self, app):
-        """Inspect routes — the SSE GET endpoint must be on the app."""
+        """The SSE GET endpoint must be on the app."""
         paths = {
             getattr(r, "path", None)
             for r in app.routes
@@ -50,8 +95,6 @@ class TestFastAPIApp:
 
     def test_messages_mount_registered(self, app):
         """The /messages/ Mount routes JSON-RPC POSTs to the SSE transport."""
-        # A Mount exposes its path via .path (ending slash is stripped by Starlette
-        # internally, but we registered "/messages/")
         mounts = [r for r in app.routes if r.__class__.__name__ == "Mount"]
         assert any(getattr(m, "path", "").startswith("/messages") for m in mounts), (
             f"No /messages mount found in routes: {[type(r).__name__ for r in app.routes]}"
@@ -62,13 +105,11 @@ class TestFastAPIApp:
 class TestIntegrationWithConfluence:
     """Integration tests that require a live Confluence instance.
 
-    These tests are skipped by default. Set CONFLUENCE_INTEGRATION_TEST=1
-    environment variable to run them.
+    Skipped by default — set CONFLUENCE_INTEGRATION_TEST=1 to run.
     """
 
     @pytest.fixture
     def real_app(self):
-        """Create app with real settings for integration testing."""
         import os
         if not os.getenv("CONFLUENCE_INTEGRATION_TEST"):
             pytest.skip("Integration tests require CONFLUENCE_INTEGRATION_TEST=1")
@@ -77,18 +118,14 @@ class TestIntegrationWithConfluence:
 
     @pytest.fixture
     def integration_client(self, real_app):
-        """Create test client for integration testing."""
-        return TestClient(real_app)
+        # `with` so lifespan runs and the real Confluence client is built.
+        with TestClient(real_app) as client:
+            yield client
 
     def test_health_check_integration(self, integration_client):
-        """Test health check against real Confluence instance."""
-        # This would test against a real Confluence instance
-        # The test is skipped unless CONFLUENCE_INTEGRATION_TEST is set
         response = integration_client.get("/healthz")
 
-        # Should return 200 if Confluence is reachable, 503 if not
         assert response.status_code in [200, 503]
-
         if response.status_code == 200:
             data = response.json()
             assert data["status"] == "healthy"
