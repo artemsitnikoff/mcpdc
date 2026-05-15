@@ -60,6 +60,38 @@ class TestDispatcherCoverage:
             f"Mismatch: advertised={advertised} collected={set(tool_handlers)}"
         )
 
+    async def test_dispatcher_returns_graceful_error_for_unknown_tool(
+        self, confluence_client
+    ):
+        """The real `_dispatch` registered by `register_all_tools` must answer
+        an unknown name with a TextContent payload, not raise.
+
+        Regression guard: if someone replaces `handlers.get(name)` with
+        `handlers[name]`, MCP clients would see the session crash instead of
+        a friendly "Unknown tool" message. Captures the *actual* dispatcher
+        via a Server-shaped proxy (the same trick the `tool_handlers` fixture
+        uses, just at the outer layer).
+        """
+        from confluence_mcp.tools import register_all_tools
+
+        captured = {}
+
+        class FakeServer:
+            def call_tool(self):
+                def decorator(func):
+                    captured["fn"] = func
+                    return func
+                return decorator
+
+        register_all_tools(FakeServer(), confluence_client)
+        assert "fn" in captured, "register_all_tools did not install a dispatcher"
+
+        result = await captured["fn"]("does_not_exist", {})
+        assert result, "dispatcher must return at least one TextContent"
+        assert result[0].type == "text"
+        assert "Unknown tool" in result[0].text
+        assert "does_not_exist" in result[0].text
+
 
 # ---------------------------------------------------------------------------
 # Search
@@ -127,7 +159,13 @@ class TestGetPageHandler:
 
         text = result[0].text
         assert "hello" in text  # markdown rendering
-        assert "<p>" not in text.split("Content:")[1]  # storage stripped from body
+        # `Content Format: markdown` precedes the body separator `Content:` —
+        # take everything AFTER the last `Content:` so the assert reflects the
+        # rendered body, not the metadata line above it.
+        body = text.rsplit("Content:", 1)[-1]
+        assert "<p>" not in body, (
+            f"Storage markup must be stripped in markdown mode; body was:\n{body}"
+        )
 
     async def test_validation_no_id_no_title_returns_error(self, tool_handlers):
         result = await tool_handlers["confluence_get_page"]({})
@@ -150,9 +188,14 @@ class TestGetPageHandler:
         assert "Page not found" in result[0].text
 
     async def test_get_by_space_and_title(self, tool_handlers, mock_confluence):
-        mock_confluence.get("/rest/api/content").mock(
-            return_value=httpx.Response(200, json={"results": [_page()]})
-        )
+        # Match on `params=` so a future typo (e.g. `space=` instead of
+        # `spaceKey=`) breaks the test — without this matcher respx would
+        # accept any querystring and silently mask the regression.
+        mock_confluence.get(
+            "/rest/api/content",
+            params={"spaceKey": "PBZ", "title": "Test Page", "expand": "body.storage,space,version"},
+        ).mock(return_value=httpx.Response(200, json={"results": [_page()]}))
+
         result = await tool_handlers["confluence_get_page"](
             {"space_key": "PBZ", "title": "Test Page"}
         )
@@ -174,6 +217,9 @@ class TestCreatePageHandler:
     async def test_create_missing_required_returns_error(self, tool_handlers):
         result = await tool_handlers["confluence_create_page"]({"title": "x"})
         assert "Error" in result[0].text
+        # Make sure the user is told *what* is missing, not just that something
+        # went wrong — guards against the message drifting to a generic blob.
+        assert "space_key" in result[0].text
 
     async def test_create_403_surfaces_permission_error(self, tool_handlers, mock_confluence):
         # The PM space is read-only for the dclouds service account; create → 403.
@@ -335,8 +381,14 @@ class TestAttachmentsHandlers:
         )
         text = result[0].text
         assert "Attachment Downloaded" in text
-        # Base64 of "PDFDATA" must appear in the truncated preview.
-        assert base64.b64encode(b"PDFDATA").decode()[:10] in text
+        # Positive invariants:
+        #   - the formatter labelled the payload as base64 (the contract)
+        #   - did NOT take the file-output branch
+        #   - the preview is the actual base64 of our mock content
+        assert "Base64 Content" in text
+        assert "Saved to:" not in text
+        assert "Output: base64" in text
+        assert base64.b64encode(b"PDFDATA").decode() in text
 
     async def test_download_attachment_to_file_uses_sandbox(
         self, tool_handlers, mock_confluence, confluence_settings
@@ -413,3 +465,75 @@ class TestAttachmentsHandlers:
         )
         post = next(c for c in mock_confluence.calls if c.request.method == "POST")
         assert post.request.headers["X-Atlassian-Token"] == "no-check"
+
+    async def test_upload_writes_comment_into_multipart(
+        self, tool_handlers, mock_confluence, tmp_path
+    ):
+        """Regression: `comment` was a dead arg — it appeared in the tool's
+        text response but never made it onto the wire. This test inspects the
+        multipart body to make sure the comment field really ships.
+        """
+        small = tmp_path / "small.txt"
+        small.write_bytes(b"hi")
+        mock_confluence.post("/rest/api/content/123456/child/attachment").mock(
+            return_value=httpx.Response(200, json={
+                "results": [{
+                    "id": "att-new",
+                    "title": "small.txt",
+                    "version": {
+                        "number": 1,
+                        "when": "2026-05-14T00:00:00.000Z",
+                        "by": {"displayName": "u"},
+                    },
+                    "_links": {"download": "/x"},
+                }]
+            })
+        )
+
+        await tool_handlers["confluence_upload_attachment"]({
+            "page_id": "123456",
+            "file_path": str(small),
+            "comment": "release notes",
+        })
+
+        post = next(c for c in mock_confluence.calls if c.request.method == "POST")
+        body = post.request.content
+        # multipart bodies use form-data parts; the comment field shows up as
+        # a `name="comment"` Content-Disposition with the value in the body.
+        assert b'name="comment"' in body, (
+            "comment must travel as a multipart form field — got body:\n"
+            + body[:500].decode("latin1", errors="replace")
+        )
+        assert b"release notes" in body
+
+    async def test_upload_without_comment_omits_field(
+        self, tool_handlers, mock_confluence, tmp_path
+    ):
+        """No comment passed → no `name="comment"` part on the wire.
+
+        Pairs with the regression test above: confirms the comment plumbing
+        is opt-in, not always-on.
+        """
+        small = tmp_path / "small.txt"
+        small.write_bytes(b"hi")
+        mock_confluence.post("/rest/api/content/123456/child/attachment").mock(
+            return_value=httpx.Response(200, json={
+                "results": [{
+                    "id": "att-new",
+                    "title": "small.txt",
+                    "version": {
+                        "number": 1,
+                        "when": "2026-05-14T00:00:00.000Z",
+                        "by": {"displayName": "u"},
+                    },
+                    "_links": {"download": "/x"},
+                }]
+            })
+        )
+
+        await tool_handlers["confluence_upload_attachment"](
+            {"page_id": "123456", "file_path": str(small)}
+        )
+
+        post = next(c for c in mock_confluence.calls if c.request.method == "POST")
+        assert b'name="comment"' not in post.request.content

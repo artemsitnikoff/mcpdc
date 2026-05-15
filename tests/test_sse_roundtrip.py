@@ -136,10 +136,30 @@ async def test_messages_endpoint_is_mounted(monkeypatch, tmp_path):
                 json={"jsonrpc": "2.0", "method": "ping", "id": 1},
             )
 
-        body = response.text
-        assert '{"detail":"Not Found"}' not in body, (
-            f"/messages/ returned FastAPI's default 404, so the mount is missing. "
-            f"Body: {body!r}"
+        # FastAPI's default 404 ships `application/json` with `{"detail":"Not
+        # Found"}`. The SSE transport's "unknown session" 404 ships a different
+        # shape (text/plain, no `detail` key). Asserting on shape rather than
+        # byte-equality keeps this robust against starlette tweaking spacing
+        # in its default JSON serializer.
+        ct = response.headers.get("content-type", "")
+        # Guard `.json()` — a future regression could return JSON content-type
+        # with an empty body, which would otherwise blow up the assert with a
+        # JSONDecodeError instead of a meaningful test failure.
+        detail = None
+        if response.content and "application/json" in ct:
+            try:
+                detail = response.json().get("detail")
+            except ValueError:
+                detail = None
+        is_fastapi_default_404 = (
+            response.status_code == 404
+            and "application/json" in ct
+            and detail == "Not Found"
+        )
+        assert not is_fastapi_default_404, (
+            f"/messages/ returned FastAPI's default 404, so the mount is "
+            f"missing. Status={response.status_code} content-type={ct!r} "
+            f"body={response.text!r}"
         )
     finally:
         await _stop(server, task)

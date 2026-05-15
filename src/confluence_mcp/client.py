@@ -352,7 +352,13 @@ class ConfluenceClient:
         if size > limit:
             raise ConfluenceSizeLimitError(size, limit)
 
-        files = {"file": (filename, content)}
+        files: Dict[str, Any] = {"file": (filename, content)}
+        # `comment` rides along as an extra multipart form field. The
+        # (None, value) shape tells httpx "this is a plain field, not a
+        # second file upload" — Confluence 7.4.6 surfaces it as the
+        # attachment-version comment in the UI.
+        if comment:
+            files["comment"] = (None, comment)
         # X-Atlassian-Token: no-check is added in _request when `files` is set.
         return await self._request(
             "POST",
