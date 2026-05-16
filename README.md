@@ -54,17 +54,20 @@ pip install -e .
 
 ## Configuration
 
+This server uses **Basic Auth pass-through**: each MCP client supplies its
+own Confluence credentials via `Authorization: Basic` on every request.
+The server itself stores no credentials — only the URL of the Confluence
+instance it proxies to.
+
 1. **Copy environment template:**
    ```bash
    cp .env.example .env
    ```
 
-2. **Edit `.env` with your Confluence details:**
+2. **Edit `.env` — only the Confluence base URL and server settings:**
    ```env
    # Confluence Server connection
    CONFLUENCE_BASE_URL=https://your-confluence-server.com/confluence
-   CONFLUENCE_USERNAME=your-username
-   CONFLUENCE_PASSWORD=your-password
    CONFLUENCE_VERIFY_SSL=true
 
    # FastAPI server settings
@@ -73,68 +76,37 @@ pip install -e .
    LOG_LEVEL=INFO
    ```
 
-3. **Required permissions:** Your Confluence user needs:
-   - Read access to spaces you want to search/read
-   - Write access to spaces where you want to create/update content
+   Note: legacy `CONFLUENCE_USERNAME` / `CONFLUENCE_PASSWORD` variables are
+   ignored if present (config has `extra="ignore"` for migration safety).
+   Delete them when convenient.
+
+3. **Per-user credentials** are supplied by each MCP client in the
+   `Authorization` header — see the *Connecting to Claude* section below.
+
+4. **Required permissions** for each user's Confluence account:
+   - Read access to spaces they want to search/read
+   - Write access to spaces where they want to create/update content
    - File upload permissions for attachment operations
 
-### Service account at dclouds (operational notes)
+### CAPTCHA and the dclouds deployment
 
-The `dclouds` deployment uses a shared service account for both Jira and
-Confluence. Verified state at 2026-05-12:
+If a user gets too many 401s in a row, Confluence locks **their own**
+Confluence account behind a CAPTCHA challenge. The MCP server will surface
+this as `401` on `/sse` with the body
+`"Confluence rejected the supplied credentials"`.
 
-| Field | Value |
-|---|---|
-| Username | `jira_integration` |
-| Display name | `Integration User` |
-| User key | `ff8080818a9b61e7018bf022c45a001a` |
-| Account type | `known` (regular user, not a system/anonymous) |
-| Groups | `dc-hr`, `dc-user`, `developers`, `interaction-b24`, `jira-administrators`, `jira-developers`, `jira-users`, `loginaccess`, `users` |
+Fix: the affected user opens the Confluence UI in a browser, logs in once
+(solving the CAPTCHA), and the REST endpoints unstick. No server-side
+intervention is needed.
 
-**Visible Confluence spaces (all global, 4 total):**
-
-| Key | Name | Read | Write |
-|---|---|---|---|
-| `HR` | DC HR — Human resources | ✅ | ✅ |
-| `PM` | PM ХХХ | ✅ | ❌ (403 on create) |
-| `onboarding` | Онбординг | ✅ | ✅ |
-| `PBZ` | Проект "База знаний" | ✅ | ✅ |
-
-`PM` is read-only for this account — write tools will return 403 there. Use
-one of the other three spaces for create/update/delete operations. There is
-no personal space.
-
-**Shared credentials.** The same `jira_integration` password is used by the
-sibling automations in `Arkady/`:
-
-- `Arkady/ArkadyJarvis/.env`  (`JIRA_PASSWORD=…`)
-- `Arkady/ArkadySuperMan/.env`
-
-If you rotate the password (see below), update all three `.env` files,
-otherwise those services will start failing with 401.
-
-**Verify the account is still working:**
-
-```bash
-curl -u "$CONFLUENCE_USERNAME:$CONFLUENCE_PASSWORD" \
-  "$CONFLUENCE_BASE_URL/rest/api/user/current"
-# Expect 200 + JSON with username=jira_integration
-```
-
-If you get HTML or a redirect to a login form, the account is locked by
-CAPTCHA after failed logins — open the Confluence UI in a browser, log in
-as `jira_integration` once, solve the CAPTCHA, and the REST endpoint will
-unstick.
-
-**Rotate the password (Confluence Server 7.4.6).**
-
-1. Sign in as a Confluence admin and go to
-   `https://jira.dclouds.ru/confluence/admin/users/edituser.action?username=jira_integration`
-   (admin → User Management → search "jira_integration" → Edit).
-2. Change password — save.
-3. Update the new value in every `.env` listed above and in this project's
-   `.env`. Restart the MCP server and any Arkady service that uses it.
-4. Re-run the health check from this README to confirm.
+The dclouds installation also has a shared service account
+`jira_integration` (used by the sibling `Arkady/` automations for Jira). It
+is **not** used by this MCP server — but if you want to test against
+dclouds without setting up a personal account, you can put its credentials
+in your `.mcp.json` headers temporarily. The password lives in
+`Arkady/ArkadyJarvis/.env` and `Arkady/ArkadySuperMan/.env` and is rotated
+through the Confluence admin UI:
+`https://jira.dclouds.ru/confluence/admin/users/edituser.action?username=jira_integration`.
 
 ## Running the Server
 
@@ -160,15 +132,17 @@ The server starts on `http://127.0.0.1:8765` by default (change via `HOST` / `PO
 
 ### Health Check
 
-Verify the server is running and can connect to Confluence:
+Verify the server process is alive:
 
 ```bash
 curl http://127.0.0.1:8765/healthz
-# → {"status":"healthy","confluence":"connected"}
+# → {"status":"healthy"}
 ```
 
-This endpoint hits Confluence (`GET /rest/api/space?limit=1`) so a 200 means
-auth + reachability are both green.
+This is a **liveness probe** — it only confirms the FastAPI app finished
+its startup and the HTTP/SSE plumbing is ready. It does **not** call
+Confluence: there is no shared service account to authenticate with.
+Confluence reachability is verified per user on each `/sse` connection.
 
 ## Docker deployment
 
@@ -181,7 +155,8 @@ roughly 125–150 MB.
 ```bash
 # 1. Have .env in this directory (NOT baked into the image — see .dockerignore)
 cp .env.example .env
-# edit .env: CONFLUENCE_BASE_URL, CONFLUENCE_USERNAME, CONFLUENCE_PASSWORD
+# edit .env: CONFLUENCE_BASE_URL (and CONFLUENCE_VERIFY_SSL if needed).
+# Per-user credentials are NOT stored here — see the Configuration section.
 
 # 2. Build and start
 docker compose up --build -d
@@ -201,8 +176,11 @@ The container publishes port `8765` on the host. Override with `PORT` in
   — your `.env` setting for `HOST` is ignored inside the container, otherwise
   the published port would not reach the process.
 - A container `healthcheck` polls `/healthz` every 30 s. `docker ps` will
-  show the container state as `unhealthy` if Confluence becomes unreachable
-  (wrong creds, CAPTCHA, network).
+  show the container as `unhealthy` only when the **process itself** falls
+  over — `/healthz` is a liveness probe and does not call Confluence. With
+  the Basic Auth pass-through model the server has no shared creds, so
+  Confluence reachability/CAPTCHA/wrong-password failures show up at SSE
+  connect time (401/502 to the MCP client), not as container health.
 
 ### Verify the running container
 
@@ -234,8 +212,16 @@ services in the same `docker-compose.yml`.)
 This server speaks **MCP over HTTP+SSE**, not stdio. The transport is
 `SseServerTransport` from the official MCP SDK, wired into FastAPI:
 
-- `GET  /sse`          — opens an SSE stream and emits the `endpoint` event
-- `POST /messages/`    — JSON-RPC channel (session id is passed as query param)
+- `GET  /sse`          — opens an SSE stream and emits the `endpoint` event.
+                         Requires `Authorization: Basic <base64(user:pass)>`.
+- `POST /messages/`    — JSON-RPC channel (session id as query param). Also
+                         requires `Authorization: Basic` (the server enforces
+                         the header but does not re-validate against
+                         Confluence — the SSE handshake already did).
+
+Each MCP client embeds its **own** Confluence credentials in the
+`Authorization` header. Different users connecting to the same server see
+different spaces, write under their own accounts, and don't share state.
 
 ### Claude Code
 
@@ -246,10 +232,19 @@ This server speaks **MCP over HTTP+SSE**, not stdio. The transport is
   "mcpServers": {
     "confluence": {
       "type": "sse",
-      "url": "http://127.0.0.1:8765/sse"
+      "url": "http://127.0.0.1:8765/sse",
+      "headers": {
+        "Authorization": "Basic <base64(your-username:your-password)>"
+      }
     }
   }
 }
+```
+
+Generate the base64 value (macOS/Linux):
+
+```bash
+echo -n "alice:my-confluence-password" | base64
 ```
 
 Make sure the server is already running before launching Claude Code.
@@ -257,14 +252,21 @@ Make sure the server is already running before launching Claude Code.
 ### Claude Desktop
 
 Claude Desktop's stdio integration cannot speak SSE directly. Use the
-[`mcp-remote`](https://www.npmjs.com/package/mcp-remote) shim to bridge:
+[`mcp-remote`](https://www.npmjs.com/package/mcp-remote) shim and pass the
+auth header via `--header`:
 
 ```json
 {
   "mcpServers": {
     "confluence": {
       "command": "npx",
-      "args": ["-y", "mcp-remote", "http://127.0.0.1:8765/sse"]
+      "args": [
+        "-y",
+        "mcp-remote",
+        "http://127.0.0.1:8765/sse",
+        "--header",
+        "Authorization: Basic <base64(user:pass)>"
+      ]
     }
   }
 }
@@ -275,6 +277,7 @@ Claude Desktop's stdio integration cannot speak SSE directly. Use the
 ```bash
 npx @modelcontextprotocol/inspector
 # In the UI, choose transport=SSE, URL=http://127.0.0.1:8765/sse
+# Add a custom header: Authorization: Basic <base64(user:pass)>
 ```
 
 ## Available Tools
@@ -361,8 +364,6 @@ Integration tests require a live Confluence instance:
 # Set up environment for integration testing
 export CONFLUENCE_INTEGRATION_TEST=1
 export CONFLUENCE_BASE_URL=https://your-test-confluence.com
-export CONFLUENCE_USERNAME=test-user
-export CONFLUENCE_PASSWORD=test-password
 
 # Run integration tests
 pytest -m integration
@@ -374,10 +375,12 @@ pytest -m integration
 
 ```
 src/confluence_mcp/
-├── app.py              # FastAPI app: lifespan, /healthz, /sse, /messages/ mount
+├── app.py              # FastAPI app: lifespan, /healthz, _parse_basic_auth,
+│                       # /sse (Basic Auth + per-session client), /messages/ mount
 ├── mcp_server.py       # mcp.Server creation, list_tools registration
-├── client.py           # Async Confluence REST client (httpx)
-├── config.py           # Pydantic settings from env
+├── client.py           # Async Confluence REST client (httpx); per-session
+├── config.py           # Pydantic settings from env (server-level only)
+├── session.py          # ContextVar + LazyConfluenceClient — per-session plumbing
 ├── converters.py       # Storage XHTML → Markdown (one-way)
 ├── errors.py           # Mapped exceptions for REST error responses
 └── tools/
@@ -388,10 +391,14 @@ src/confluence_mcp/
     └── attachments.py  # Multipart upload sends X-Atlassian-Token: no-check
 ```
 
-(\*) The MCP SDK exposes a single global `@server.call_tool()` slot — registering
-multiple handlers overwrites it. `tools/__init__.py` collects handlers from each
-module via a Server-shaped proxy and installs one dispatcher that routes by tool
-name. There is a regression test for this in `tests/test_tools.py::TestDispatcher`.
+(\*) The MCP SDK exposes a single global `@server.call_tool()` slot —
+registering multiple handlers overwrites it. `tools/__init__.py` collects
+handlers from each module via a Server-shaped proxy and installs one
+dispatcher that routes by tool name. Handlers receive a `LazyConfluenceClient`
+proxy at registration time; it resolves to the calling session's client via
+a contextvar set in `/sse`. There is a regression test for the dispatcher in
+`tests/test_handlers.py::TestDispatcherCoverage`, and for the per-session
+isolation in `tests/test_auth.py::TestContextvarIsolation`.
 
 ## Development
 
@@ -413,7 +420,8 @@ mypy src
 1. Create tool implementation in appropriate file under `tools/`
 2. Add tool to the module's `TOOLS` list
 3. Register in `tools/__init__.py`
-4. Add tests in `tests/test_tools.py`
+4. Add behavioural tests in `tests/test_handlers.py` (schema-shape regressions
+   go in `tests/test_tools.py`)
 
 ### Debugging
 
@@ -435,24 +443,43 @@ This will show all HTTP requests to Confluence (URLs and status codes, but not s
 
 ## Security Notes
 
-- **Credentials in environment**: Keep `.env` file secure, never commit it
-- **HTTPS recommended**: Use HTTPS for Confluence connection in production
-- **Network security**: Consider firewall rules for MCP server port
-- **Confluence permissions**: Use principle of least privilege for API user
+- **Credentials live in the MCP client, not the server**: each user keeps
+  their own `Authorization: Basic` value in their `.mcp.json`. The server's
+  `.env` contains only the Confluence base URL.
+- **HTTPS recommended**: Use HTTPS for Confluence connection in production —
+  Basic Auth credentials are otherwise sent in cleartext over the wire.
+- **TLS for the MCP server itself**: if MCP clients are not on the same host
+  as the server, terminate TLS in front of it (reverse proxy, ingress). The
+  same `Authorization` header travels to the server on every request.
+- **Network security**: Consider firewall rules for MCP server port.
+- **Confluence permissions**: each user should authenticate as themselves;
+  the server does not need a privileged service account.
 
 ## Troubleshooting
 
 ### Connection Issues
 
-1. **Health check fails**: Test manually with `curl http://127.0.0.1:8765/healthz`
-2. **401 Unauthorized**: Verify username/password in `.env`
-3. **SSL errors**: Set `CONFLUENCE_VERIFY_SSL=false` for self-signed certificates
-4. **CAPTCHA activated**: Use different credentials, or log in via the Confluence UI once to clear it
-5. **MCP client hangs on `connect`**: macOS / corp networks often expose a local
+1. **Health check fails**: Test manually with `curl http://127.0.0.1:8765/healthz`.
+   Expect `{"status":"healthy"}` — this only checks the process is alive,
+   not Confluence reachability.
+2. **401 Unauthorized on /sse**: Verify the `Authorization: Basic <base64>`
+   header in your `.mcp.json` matches a working Confluence account. Test
+   the same credentials by hand: `curl -u "user:pass" "$CONFLUENCE_BASE_URL/rest/api/user/current"`.
+3. **502 Bad Gateway on /sse**: The MCP server reached Confluence but
+   Confluence returned 5xx or the connection failed. Distinct from 401
+   so you can tell a creds issue from an outage.
+4. **403 Forbidden on /messages/**: The `Authorization` header in your POST
+   doesn't match the user that opened the SSE session (the hijacking
+   guard). Usually means your MCP client cached an old session — restart it.
+5. **SSL errors**: Set `CONFLUENCE_VERIFY_SSL=false` for self-signed certificates.
+6. **CAPTCHA activated**: After repeated 401s Confluence locks the *account*
+   behind a CAPTCHA. Sign in via the Confluence UI as that user once to
+   solve it; the REST endpoints will unstick.
+7. **MCP client hangs on `connect`**: macOS / corp networks often expose a local
    HTTP proxy (e.g. Clash, Shadowsocks). `httpx` will route `127.0.0.1` traffic
    *through* the proxy unless told otherwise. Run the MCP client with
    `NO_PROXY=127.0.0.1,localhost` set in its environment.
-6. **Old behavior after source change**: Python caches compiled modules under
+8. **Old behavior after source change**: Python caches compiled modules under
    `src/**/__pycache__/`. If a restart doesn't pick up edits, remove the cache:
    `find src -name __pycache__ -exec rm -rf {} +`.
 

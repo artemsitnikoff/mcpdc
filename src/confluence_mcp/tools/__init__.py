@@ -4,6 +4,11 @@ The MCP Python SDK exposes a single `@server.call_tool()` slot — registering
 multiple handlers overwrites it. Each tool module here was written to register
 its own handler, so we collect them via a Server-shaped proxy and install one
 global dispatcher that routes by tool name.
+
+The tools don't take a concrete `ConfluenceClient` anymore: per-session
+authentication means we don't know whose client to use at registration time.
+Instead, every tool module gets a `LazyConfluenceClient` proxy that resolves
+to the current session's client via a contextvar at call time.
 """
 
 import logging
@@ -12,7 +17,7 @@ from typing import Any, Callable, Dict, List
 from mcp.server import Server
 from mcp.types import TextContent
 
-from ..client import ConfluenceClient
+from ..session import LazyConfluenceClient
 from .search import register_search_tools, SEARCH_TOOLS
 from .pages import register_page_tools, PAGE_TOOLS
 from .comments import register_comment_tools, COMMENT_TOOLS
@@ -36,7 +41,16 @@ class _HandlerCollector:
         return decorator
 
 
-def register_all_tools(server: Server, confluence: ConfluenceClient) -> None:
+def register_all_tools(server: Server) -> None:
+    """Wire every tool's handler into the MCP server's single dispatcher slot.
+
+    Hands each tool module a `LazyConfluenceClient` proxy that resolves the
+    current per-session client at call time, instead of capturing one client
+    at registration time. Without this, the first session's credentials would
+    be reused for every subsequent caller.
+    """
+    confluence = LazyConfluenceClient()
+
     collector = _HandlerCollector()
     register_search_tools(collector, confluence)
     register_page_tools(collector, confluence)

@@ -1,4 +1,9 @@
-"""Configuration settings for Confluence MCP server."""
+"""Configuration settings for Confluence MCP server.
+
+Server-level config only. Per-user credentials (username/password) are passed
+in by the MCP client via `Authorization: Basic` on every request and never
+live in Settings or `.env`.
+"""
 
 import os
 from typing import Optional
@@ -10,10 +15,7 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
-    # Confluence connection - make optional for tests
     confluence_base_url: Optional[str] = Field(None, description="Confluence Server base URL")
-    confluence_username: Optional[str] = Field(None, description="Username for Basic Auth")
-    confluence_password: Optional[str] = Field(None, description="Password for Basic Auth")
     confluence_verify_ssl: bool = Field(True, description="Verify SSL certificates")
 
     # FastAPI server
@@ -52,17 +54,22 @@ class Settings(BaseSettings):
         return v_upper
 
     def validate_required_fields(self) -> None:
-        """Validate that required fields are present for production use."""
+        """Validate that required fields are present for production use.
+
+        Credentials are NOT required here — they're supplied per-request via
+        the MCP client's `Authorization: Basic` header.
+        """
         if not self.confluence_base_url:
             raise ValueError("CONFLUENCE_BASE_URL is required")
-        if not self.confluence_username:
-            raise ValueError("CONFLUENCE_USERNAME is required")
-        if not self.confluence_password:
-            raise ValueError("CONFLUENCE_PASSWORD is required")
 
     model_config = ConfigDict(
         env_file=".env",
         case_sensitive=False,
+        # `extra="ignore"` so that legacy `.env` files left over from the
+        # shared-credentials era (CONFLUENCE_USERNAME / CONFLUENCE_PASSWORD)
+        # don't break startup. Those variables are no longer read; new clients
+        # supply credentials via Basic Auth.
+        extra="ignore",
     )
 
 

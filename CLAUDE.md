@@ -2,7 +2,7 @@
 
 Python MCP-сервер над **Atlassian Confluence Server 7.4.6** (on-prem, EOL Server-линейка). REST API wrapper, без установки плагина в сам Confluence. Транспорт MCP — **HTTP + SSE** (через `SseServerTransport` от официального MCP SDK, смонтирован в FastAPI), не stdio.
 
-Целевой инстанс: `https://jira.dclouds.ru/confluence`. Auth: **Basic Auth only** (PAT появились только в Confluence 7.9). Креды в `.env`.
+Целевой инстанс: `https://jira.dclouds.ru/confluence`. Auth модель — **Basic Auth pass-through**: каждый MCP-клиент шлёт свои собственные Confluence-креды в заголовке `Authorization: Basic` на каждый запрос. Сервер сам не имеет shared service account — в `.env` живёт только `CONFLUENCE_BASE_URL`. PAT не используются (появились только в Confluence 7.9).
 
 ## Что важно помнить при правках
 
@@ -14,7 +14,39 @@ Python MCP-сервер над **Atlassian Confluence Server 7.4.6** (on-prem, E
 - Комментарии: `POST /rest/api/content` обязательно требует `container.type = "page"`, иначе 500. См. `tools/comments.py:147`.
 - Multipart upload: обязательно `X-Atlassian-Token: no-check` (CSRF), добавляется автоматически в `client._request` когда передан `files=`.
 - Update страницы — клиент сам делает GET → version+1 → PUT (`client.py:216`). Не пытайся передавать version извне.
-- CAPTCHA: после нескольких 401 аккаунт залочат капчей. `/rest/api/user/current` начнёт отдавать HTML вместо JSON. Лечится логином через UI один раз.
+- **CAPTCHA**: после нескольких 401 Confluence лочит **сам аккаунт** капчей. `/rest/api/user/current` начнёт отдавать HTML вместо JSON. Поскольку у нас Basic Auth pass-through, это случается с **аккаунтом конкретного пользователя**, не сервиса целиком — `_build_session_client` в `app.py` поймает это как `ConfluenceAuthError` и отдаст 401 на /sse. Лечится логином через UI один раз под этим аккаунтом.
+
+### 1.5. Basic Auth pass-through — мульти-арендность
+
+Сервер не имеет shared service account. На каждое /sse подключение:
+
+1. `_parse_basic_auth(request.headers["Authorization"])` достаёт `(user, pass)`. Любой не-`Basic`, кривой base64, отсутствие двоеточия, пустые поля → 401 + `WWW-Authenticate: Basic`.
+2. Строится новый `ConfluenceClient(settings, user, pass)`, http_client (общий пул) подсаживается.
+3. **Один валидирующий запрос** `GET /rest/api/user/current` (через `client.validate_credentials()` — в отличие от либерального `health_check`, не глотает исключения). 401 от Confluence → 401 пользователю; 403 → 403 (нет read-доступа у аккаунта); transport-error → 502.
+4. Клиент кладётся в `current_confluence_client` (ContextVar). Тулзы внутри `mcp_server.run(...)` достают его через `LazyConfluenceClient` (см. пункт 2 ниже).
+5. На `finally` в /sse — `current_confluence_client.reset(token)`.
+
+На `/messages/` (ASGI mount) тоже проверяется наличие `Authorization: Basic` — но без повторного хода в Confluence. session_id уже доказательство, что владелец прошёл валидацию на /sse.
+
+Тесты этого слоя: `tests/test_auth.py`. Особенно — `TestContextvarIsolation::test_concurrent_tasks_see_distinct_clients` (anti-regression на «случайно сохранил одного глобального клиента»).
+
+Подключение из MCP-клиента:
+
+```json
+{
+  "mcpServers": {
+    "confluence": {
+      "type": "sse",
+      "url": "http://127.0.0.1:8765/sse",
+      "headers": {
+        "Authorization": "Basic <base64(user:pass)>"
+      }
+    }
+  }
+}
+```
+
+Каждый разработчик кладёт свои креды в свой `.mcp.json`. Видимость пространств = что у этого аккаунта в Confluence.
 
 ### 2. Один глобальный `@server.call_tool()` в MCP SDK
 
@@ -23,7 +55,7 @@ Python MCP-сервер над **Atlassian Confluence Server 7.4.6** (on-prem, E
 - Каждый модуль (`pages.py`, `search.py`, …) регистрирует свои хендлеры через объект, который **крякает как Server** (`_HandlerCollector`).
 - В реальный `Server` регистрируется **один** `_dispatch(name, arguments)`, который роутит по имени тулзы.
 
-Если добавляешь новый модуль с тулзами — повторяй этот же паттерн (`register_X_tools(server, confluence)` + список `X_TOOLS`), и добавь его в `register_all_tools` и `ALL_TOOLS`. Регрессия на это уже есть: `tests/test_tools.py::TestDispatcher`.
+Если добавляешь новый модуль с тулзами — повторяй этот же паттерн (`register_X_tools(server, confluence)` + список `X_TOOLS`), и добавь его в `register_all_tools` и `ALL_TOOLS`. Регрессия на это уже есть: `tests/test_handlers.py::TestDispatcherCoverage`.
 
 ### 3. Никаких `oneOf` / `allOf` / `anyOf` на верхнем уровне `inputSchema`
 
@@ -33,9 +65,10 @@ Anthropic API отбрасывает весь запрос с `400 tools.N.custo
 
 ### 4. Транспорт — SSE, не stdio
 
-- `GET /sse` открывает SSE-стрим, MCP SDK эмитит событие `endpoint`.
-- `POST /messages/?session_id=…` — JSON-RPC канал.
-- **`SseServerTransport` инстанцируется per-app в `lifespan`** (`app.py:35`), чтобы повторные `create_app()` (в тестах) не делили session-таблицу.
+- `GET /sse` открывает SSE-стрим, MCP SDK эмитит событие `endpoint`. Требует `Authorization: Basic`.
+- `POST /messages/?session_id=…` — JSON-RPC канал. Тоже требует `Authorization: Basic` (формальная проверка, не повторный ход в Confluence).
+- **`SseServerTransport` инстанцируется per-app в `lifespan`**, чтобы повторные `create_app()` (в тестах) не делили session-таблицу.
+- Per-сессионный `ConfluenceClient` пробрасывается в тулзы через `current_confluence_client` ContextVar — `mcp_server.run(...)` крутит весь session loop в одной asyncio-таске, контекстvar наследуется во всех child-tasks.
 - В тестах FastAPI `TestClient` SSE-протокол **не гоняет** — реальный round-trip нужно проверять `mcp.client.sse.sse_client`. См. ниже про проверку субагентами.
 
 ### 5. CRITICAL: верификация субагентов
@@ -69,14 +102,15 @@ async with sse_client("http://127.0.0.1:8765/sse") as (r, w):
 ```
 src/confluence_mcp/
 ├── __main__.py        # python -m confluence_mcp → uvicorn + create_app()
-├── app.py             # FastAPI: lifespan, /healthz, /sse, /messages/ mount
-├── mcp_server.py      # mcp.Server, list_tools, register_all_tools
-├── client.py          # Async REST client. Retry 5xx только для GET/HEAD/OPTIONS
-├── config.py          # pydantic-settings из .env. Поля опциональны для тестов
+├── app.py             # FastAPI: lifespan, /healthz, _parse_basic_auth, /sse, /messages/
+├── mcp_server.py      # mcp.Server, list_tools, register_all_tools()
+├── client.py          # Async REST client. ConfluenceClient(settings, username, password)
+├── config.py          # pydantic-settings из .env. Только server-level (base_url, лимиты)
+├── session.py         # ContextVar + LazyConfluenceClient — per-session client plumbing
 ├── converters.py      # Storage XHTML → Markdown (lossy, one-way; макросы упрощаются)
 ├── errors.py          # Маппинг HTTP-кодов на типизированные исключения
 └── tools/
-    ├── __init__.py    # _HandlerCollector + единый _dispatch
+    ├── __init__.py    # _HandlerCollector + единый _dispatch (без аргумента confluence)
     ├── search.py      # confluence_search (CQL)
     ├── pages.py       # get/create/update/delete (update сам инкрементит version)
     ├── comments.py    # list/add (container.type=page обязателен)
@@ -99,15 +133,17 @@ src/confluence_mcp/
 
 Хард-лимиты в `.env`: `CONFLUENCE_MAX_UPLOAD_BYTES`, `CONFLUENCE_MAX_DOWNLOAD_BYTES` (по умолчанию 25 MiB каждый).
 
-## Сервисный аккаунт dclouds
+## dclouds — про что важно помнить
 
-- Логин `jira_integration`. Пароль лежит **в трёх .env** и должен быть синхронизирован:
-  - `mcp/confluence/.env` (`CONFLUENCE_PASSWORD`)
+Этот сервер больше не привязан к конкретному аккаунту dclouds. Каждый пользователь логинится в Confluence своими кредами через `Authorization: Basic` на /sse. Но если запускается тест/интеграция вручную против реального инстанса — может пригодиться сервисный аккаунт `jira_integration` (тот же, что использует Arkady-стек для Jira REST):
+
+- Логин `jira_integration`. Пароль лежит **в трёх .env** (синхронизированы):
   - `Arkady/ArkadyJarvis/.env` (`JIRA_PASSWORD`)
   - `Arkady/ArkadySuperMan/.env`
+  - **больше НЕ в** `mcp/confluence/.env` — этот сервер кредов аккаунта вообще не знает.
 - Видит 4 глобальных спейса: `HR`, `onboarding`, `PBZ` (read+write), `PM` (read-only, create → 403).
-- Тестовая песочница — **`PBZ`** ("Проект 'База знаний'"). На `PM` write-тесты упадут на 403, это не баг.
-- Проверка: `curl -u "$CONFLUENCE_USERNAME:$CONFLUENCE_PASSWORD" "$CONFLUENCE_BASE_URL/rest/api/user/current"` → 200+JSON. HTML/redirect = CAPTCHA, разлочить логином через UI.
+- Удобная тестовая песочница — **`PBZ`** ("Проект 'База знаний'").
+- Проверка кредов: `curl -u "jira_integration:$PASS" "$CONFLUENCE_BASE_URL/rest/api/user/current"` → 200+JSON. HTML/redirect = CAPTCHA, разлочить логином через UI.
 
 ## Команды
 
@@ -134,13 +170,25 @@ docker compose logs -f confluence-mcp
 
 ## Подключение клиентов
 
+Auth header обязателен — без него /sse и /messages/ отдадут 401.
+
 Claude Code (`.mcp.json`):
 
 ```json
-{ "mcpServers": { "confluence": { "type": "sse", "url": "http://127.0.0.1:8765/sse" } } }
+{
+  "mcpServers": {
+    "confluence": {
+      "type": "sse",
+      "url": "http://127.0.0.1:8765/sse",
+      "headers": { "Authorization": "Basic <base64(user:pass)>" }
+    }
+  }
+}
 ```
 
-Claude Desktop не умеет SSE нативно — шим через `npx -y mcp-remote http://127.0.0.1:8765/sse`.
+Base64 сгенерить: `echo -n "user:pass" | base64`.
+
+Claude Desktop не умеет SSE нативно — шим: `npx -y mcp-remote http://127.0.0.1:8765/sse --header "Authorization: Basic <base64>"`.
 
 ## Известные ограничения (живут на TODO)
 

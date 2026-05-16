@@ -4,20 +4,22 @@ import logging
 
 from mcp.server import Server
 
-from .client import ConfluenceClient
 from .tools import register_all_tools, ALL_TOOLS
 
 logger = logging.getLogger(__name__)
 
 
-def create_mcp_server(confluence_client: ConfluenceClient) -> Server:
-    """Create and configure the MCP server."""
+def create_mcp_server() -> Server:
+    """Create and configure the MCP server.
+
+    The server is shared across all SSE sessions; per-session Confluence
+    clients are looked up via contextvar inside each tool dispatch, so the
+    server itself is credential-agnostic.
+    """
     server = Server("confluence-mcp")
 
-    # Register all tools
-    register_all_tools(server, confluence_client)
+    register_all_tools(server)
 
-    # Add tool list to server for introspection
     @server.list_tools()
     async def list_tools():
         """List available tools."""

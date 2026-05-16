@@ -191,8 +191,8 @@ class TestConfluenceClient:
 
     async def test_health_check_success(self, confluence_client, mock_confluence):
         """Test successful health check."""
-        mock_confluence.get("/rest/api/space").mock(
-            return_value=httpx.Response(200, json={"results": []})
+        mock_confluence.get("/rest/api/user/current").mock(
+            return_value=httpx.Response(200, json={"username": "testuser"})
         )
 
         result = await confluence_client.health_check()
@@ -201,13 +201,143 @@ class TestConfluenceClient:
 
     async def test_health_check_failure(self, confluence_client, mock_confluence):
         """Test failed health check."""
-        mock_confluence.get("/rest/api/space").mock(
+        mock_confluence.get("/rest/api/user/current").mock(
             return_value=httpx.Response(500, text="Server Error")
         )
 
         result = await confluence_client.health_check()
 
         assert result is False
+
+    async def test_validate_credentials_success(self, confluence_client, mock_confluence):
+        """validate_credentials returns None on 200."""
+        mock_confluence.get("/rest/api/user/current").mock(
+            return_value=httpx.Response(200, json={"username": "testuser"})
+        )
+        # No exception, returns None.
+        result = await confluence_client.validate_credentials()
+        assert result is None
+
+    async def test_validate_credentials_propagates_auth_error(
+        self, confluence_client, mock_confluence
+    ):
+        """validate_credentials surfaces 401 as ConfluenceAuthError, not bool."""
+        from confluence_mcp.errors import ConfluenceAuthError
+
+        mock_confluence.get("/rest/api/user/current").mock(
+            return_value=httpx.Response(401, json={"message": "bad creds"})
+        )
+        with pytest.raises(ConfluenceAuthError):
+            await confluence_client.validate_credentials()
+
+    async def test_validate_credentials_propagates_transport_error(
+        self, confluence_client, mock_confluence
+    ):
+        """validate_credentials surfaces 5xx as ConfluenceError, distinct from auth and permission."""
+        from confluence_mcp.errors import (
+            ConfluenceAuthError,
+            ConfluenceError,
+            ConfluencePermissionError,
+        )
+
+        mock_confluence.get("/rest/api/user/current").mock(
+            return_value=httpx.Response(503, text="upstream down")
+        )
+        with pytest.raises(ConfluenceError) as exc_info:
+            await confluence_client.validate_credentials()
+        # Must NOT be mis-typed as either of the subclasses — that's how
+        # /sse distinguishes 401 vs 403 vs 502 in the response to the
+        # MCP client.
+        assert not isinstance(exc_info.value, ConfluenceAuthError)
+        assert not isinstance(exc_info.value, ConfluencePermissionError)
+
+    async def test_validate_credentials_propagates_permission_error(
+        self, confluence_client, mock_confluence
+    ):
+        """validate_credentials surfaces 403 as ConfluencePermissionError.
+
+        Regression: `ConfluencePermissionError` is a `ConfluenceError`
+        subclass; if /sse's exception handler doesn't catch it before the
+        generic branch, a "no read access" answer becomes a 502, sending
+        users to chase outages instead of asking for permission.
+        """
+        from confluence_mcp.errors import ConfluencePermissionError
+
+        mock_confluence.get("/rest/api/user/current").mock(
+            return_value=httpx.Response(403, json={"message": "no read access"})
+        )
+        with pytest.raises(ConfluencePermissionError):
+            await confluence_client.validate_credentials()
+
+    async def test_request_maps_html_response_to_auth_error(
+        self, confluence_client, mock_confluence
+    ):
+        """Confluence returns HTML 200 when an account is CAPTCHA-locked.
+
+        `_request` must convert the resulting JSONDecodeError into a
+        ConfluenceAuthError, so callers can surface "log in via UI" instead
+        of a bare parse error.
+        """
+        from confluence_mcp.errors import ConfluenceAuthError
+
+        mock_confluence.get("/rest/api/user/current").mock(
+            return_value=httpx.Response(
+                200,
+                content=b"<html><body>Please log in</body></html>",
+                headers={"content-type": "text/html; charset=utf-8"},
+            )
+        )
+        with pytest.raises(ConfluenceAuthError) as exc_info:
+            await confluence_client.validate_credentials()
+        assert "CAPTCHA" in exc_info.value.message
+
+    async def test_request_maps_xhtml_response_to_auth_error(
+        self, confluence_client, mock_confluence
+    ):
+        """Same CAPTCHA mapping for `application/xhtml+xml`.
+
+        Atlassian server pages historically use XHTML; relying purely on
+        `text/html` would inverse-map XHTML CAPTCHA pages into a 502
+        "unreachable" error at the /sse layer (same category bug as the
+        403→502 inversion we fixed earlier).
+        """
+        from confluence_mcp.errors import ConfluenceAuthError
+
+        mock_confluence.get("/rest/api/user/current").mock(
+            return_value=httpx.Response(
+                200,
+                content=b"<html xmlns='http://www.w3.org/1999/xhtml'><body/></html>",
+                headers={"content-type": "application/xhtml+xml; charset=utf-8"},
+            )
+        )
+        with pytest.raises(ConfluenceAuthError) as exc_info:
+            await confluence_client.validate_credentials()
+        assert "CAPTCHA" in exc_info.value.message
+
+    async def test_request_maps_other_non_json_to_transport_error(
+        self, confluence_client, mock_confluence
+    ):
+        """Non-HTML, non-JSON responses get a plain ConfluenceError.
+
+        Guards against the reverse mistake: lumping every non-JSON answer
+        under CAPTCHA tells users to "log in via UI" when the real cause
+        is a misbehaving proxy or upstream returning text/plain.
+        """
+        from confluence_mcp.errors import ConfluenceAuthError, ConfluenceError
+
+        mock_confluence.get("/rest/api/user/current").mock(
+            return_value=httpx.Response(
+                200,
+                content=b"OK",
+                headers={"content-type": "text/plain"},
+            )
+        )
+        with pytest.raises(ConfluenceError) as exc_info:
+            await confluence_client.validate_credentials()
+        # Not the auth-error subclass — must surface as a transport-like
+        # error so /sse responds with 502, not 401.
+        assert not isinstance(exc_info.value, ConfluenceAuthError)
+        assert "text/plain" in exc_info.value.message
 
     async def test_error_handling_404(self, confluence_client, mock_confluence):
         """Test 404 error handling."""

@@ -28,23 +28,27 @@ logger = logging.getLogger(__name__)
 
 
 class ConfluenceClient:
-    """Async client for Confluence Server REST API."""
+    """Async client for Confluence Server REST API.
 
-    def __init__(self, settings: Settings):
+    One instance per authenticated MCP session: the SSE handler builds a client
+    with the caller's Basic-Auth credentials and stows it in a contextvar that
+    the tool dispatcher reads. There is no shared/service-account client.
+    """
+
+    def __init__(self, settings: Settings, username: str, password: str):
         self.settings = settings
 
-        # Validate required settings
         if not settings.confluence_base_url:
             raise ValueError("CONFLUENCE_BASE_URL is required")
-        if not settings.confluence_username:
-            raise ValueError("CONFLUENCE_USERNAME is required")
-        if not settings.confluence_password:
-            raise ValueError("CONFLUENCE_PASSWORD is required")
+        if not username:
+            raise ValueError("username is required")
+        if not password:
+            raise ValueError("password is required")
 
         self.base_url = settings.confluence_base_url
+        self.username = username
 
-        # Setup Basic Auth
-        credentials = f"{settings.confluence_username}:{settings.confluence_password}"
+        credentials = f"{username}:{password}"
         encoded_credentials = base64.b64encode(credentials.encode()).decode()
 
         self.headers = {
@@ -53,7 +57,8 @@ class ConfluenceClient:
             "Content-Type": "application/json",
         }
 
-        # HTTP client will be set during lifespan
+        # HTTP client is shared across sessions; set by `set_http_client` once
+        # the FastAPI lifespan has created the connection pool.
         self.http_client: Optional[httpx.AsyncClient] = None
 
     def set_http_client(self, client: httpx.AsyncClient) -> None:
@@ -118,7 +123,29 @@ class ConfluenceClient:
             if response.status_code == 204:  # No content
                 return {}
 
-            return response.json()
+            try:
+                return response.json()
+            except ValueError as exc:
+                # Distinguish the two non-JSON failure modes:
+                #   - HTML/XHTML 200 → CAPTCHA-locked account (Confluence
+                #     7.4.6 serves the login form with a 200 status after
+                #     repeated auth failures). Atlassian historically also
+                #     served XHTML pages, so cover `application/xhtml+xml`
+                #     alongside `text/html; charset=...`. Actionable:
+                #     "log in via the UI once."
+                #   - anything else (text/plain, empty body, octet-stream) is
+                #     something else entirely; conflating it with CAPTCHA
+                #     would send users on the wrong remediation path.
+                content_type = response.headers.get("content-type", "").lower()
+                if "text/html" in content_type or "xhtml" in content_type:
+                    raise ConfluenceAuthError(
+                        "Confluence returned HTML (likely CAPTCHA lock — "
+                        "open the Confluence UI as this user and re-login)"
+                    ) from exc
+                raise ConfluenceError(
+                    f"Confluence returned non-JSON response "
+                    f"(content-type={content_type!r})"
+                ) from exc
 
         except httpx.RequestError as e:
             logger.error(f"Request error: {e}")
@@ -305,10 +332,13 @@ class ConfluenceClient:
 
         limit = self.settings.confluence_max_download_bytes
         try:
+            # Send the full header set rather than just Authorization so the
+            # request stays consistent with `_request` (Accept, Content-Type
+            # would otherwise be dropped on this code path).
             async with self.http_client.stream(
                 "GET",
                 url,
-                headers={"Authorization": self.headers["Authorization"]},
+                headers=self.headers.copy(),
             ) as response:
                 if response.status_code >= 400:
                     await response.aread()
@@ -366,12 +396,38 @@ class ConfluenceClient:
             files=files,
         )
 
-    # Health check
+    # Health / auth probes
     async def health_check(self) -> bool:
-        """Check if Confluence is reachable."""
+        """Liberal "is this client useful?" probe used by tests and any liveness path.
+
+        Returns False on *any* failure — auth, transport, parse — without
+        distinguishing them. For per-session validation use
+        `validate_credentials` instead so the caller can tell apart 401 from
+        502 and surface the right HTTP status to the MCP client.
+        """
         try:
-            await self._request("GET", "/rest/api/space", params={"limit": 1})
+            await self._request("GET", "/rest/api/user/current")
             return True
         except Exception as e:
             logger.error(f"Health check failed: {e}")
             return False
+
+    async def validate_credentials(self) -> None:
+        """Probe Confluence with an auth-sensitive endpoint, propagate categories.
+
+        Unlike `health_check`, this method does NOT swallow exceptions.
+        Callers get:
+          - `ConfluenceAuthError` for 401 (wrong creds, CAPTCHA-locked
+            account — HTML response is mapped to auth error in `_request`),
+          - `ConfluencePermissionError` for 403 (account exists but lacks
+            read access — very unlikely for `/user/current` but possible
+            under custom auth plugins),
+          - `ConfluenceError` for 5xx, network failures, or other categories,
+          - the bare exception otherwise.
+
+        `/rest/api/user/current` is the right endpoint here: it is cheap,
+        always present in Server 7.4.6, and the one that flips to HTML at
+        the moment of CAPTCHA lock — which our `_request` post-processing
+        converts to a `ConfluenceAuthError`.
+        """
+        await self._request("GET", "/rest/api/user/current")

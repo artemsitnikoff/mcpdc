@@ -60,9 +60,7 @@ class TestDispatcherCoverage:
             f"Mismatch: advertised={advertised} collected={set(tool_handlers)}"
         )
 
-    async def test_dispatcher_returns_graceful_error_for_unknown_tool(
-        self, confluence_client
-    ):
+    async def test_dispatcher_returns_graceful_error_for_unknown_tool(self):
         """The real `_dispatch` registered by `register_all_tools` must answer
         an unknown name with a TextContent payload, not raise.
 
@@ -71,6 +69,10 @@ class TestDispatcherCoverage:
         a friendly "Unknown tool" message. Captures the *actual* dispatcher
         via a Server-shaped proxy (the same trick the `tool_handlers` fixture
         uses, just at the outer layer).
+
+        No active Confluence session is needed here — the "Unknown tool"
+        branch returns before any handler (and therefore any contextvar
+        lookup) runs.
         """
         from confluence_mcp.tools import register_all_tools
 
@@ -83,7 +85,7 @@ class TestDispatcherCoverage:
                     return func
                 return decorator
 
-        register_all_tools(FakeServer(), confluence_client)
+        register_all_tools(FakeServer())
         assert "fn" in captured, "register_all_tools did not install a dispatcher"
 
         result = await captured["fn"]("does_not_exist", {})

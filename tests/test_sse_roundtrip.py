@@ -11,17 +11,20 @@ frame coming out of `/sse`. The MCP SSE transport's contract is to emit:
     event: endpoint
     data: /messages/?session_id=<uuid>
 
-If we see anything else (or a 5xx, or a hung connection), MCP clients
-won't work — regardless of how many other tests pass.
+We do NOT use the full `mcp.client.sse` client here — driving the protocol
+round-trip in-process is fragile (uvicorn lifespan + pytest-asyncio share an
+event loop). Reading the first frame is enough to detect the stub-handler
+class of regressions.
 
-We do NOT use the full `mcp.client.sse` client here. Driving the protocol
-round-trip in-process is fragile (uvicorn lifespan + pytest-asyncio share
-an event loop; in practice this hung for minutes on httpx ReadTimeout).
-Reading the first frame is enough to detect the stub-handler class of
-regressions.
+Auth: /sse now requires `Authorization: Basic` and validates against
+Confluence via `validate_credentials` (which raises on auth/transport
+failures, unlike the liberal `health_check`). To keep the test offline, we
+monkeypatch `ConfluenceClient.validate_credentials` so any non-empty
+credentials are accepted.
 """
 
 import asyncio
+import base64
 import socket
 
 import httpx
@@ -29,6 +32,16 @@ import pytest
 import uvicorn
 
 from confluence_mcp.app import create_app
+from confluence_mcp.client import ConfluenceClient
+
+
+def _basic(user: str, password: str) -> str:
+    """Build a `Basic <base64>` header value.
+
+    Kept as a helper so tests can be explicit about which user authenticated,
+    instead of relying on a magic module-level constant.
+    """
+    return "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()
 
 
 def _free_port() -> int:
@@ -40,9 +53,16 @@ def _free_port() -> int:
 async def _start_app(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("CONFLUENCE_BASE_URL", "https://fake.confluence.test")
-    monkeypatch.setenv("CONFLUENCE_USERNAME", "u")
-    monkeypatch.setenv("CONFLUENCE_PASSWORD", "p")
     monkeypatch.setenv("CONFLUENCE_VERIFY_SSL", "false")
+
+    # Bypass the per-session Confluence probe. We're testing transport, not
+    # auth integration — those tests live in test_auth.py. The probe used
+    # by /sse is `validate_credentials` (returns None on success, raises on
+    # failure), not `health_check`.
+    async def _always_ok(self):
+        return None
+
+    monkeypatch.setattr(ConfluenceClient, "validate_credentials", _always_ok)
 
     port = _free_port()
     config = uvicorn.Config(
@@ -85,15 +105,18 @@ async def test_sse_emits_mcp_endpoint_event(monkeypatch, tmp_path):
     server, task, port = await _start_app(monkeypatch, tmp_path)
     try:
         async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
-            async with client.stream("GET", f"http://127.0.0.1:{port}/sse") as r:
+            async with client.stream(
+                "GET",
+                f"http://127.0.0.1:{port}/sse",
+                headers={"Authorization": _basic("u", "p")},
+            ) as r:
                 assert r.status_code == 200, (
-                    f"/sse must return 200, got {r.status_code}"
+                    f"/sse must return 200 for an authenticated request, got {r.status_code}"
                 )
                 assert "text/event-stream" in r.headers.get("content-type", ""), (
                     f"/sse must be an SSE stream, got Content-Type={r.headers.get('content-type')!r}"
                 )
 
-                # Read enough bytes to cover the first SSE event, no more.
                 buf = ""
                 try:
                     async for chunk in r.aiter_text():
@@ -106,8 +129,6 @@ async def test_sse_emits_mcp_endpoint_event(monkeypatch, tmp_path):
                     pass
 
         first_event = buf.split("\n\n", 1)[0]
-        # The MCP SSE transport names the first event `endpoint` and ships
-        # the JSON-RPC POST URL in the data line.
         assert "event: endpoint" in first_event, (
             f"Expected `event: endpoint` as first SSE frame; got:\n{first_event!r}"
         )
@@ -118,48 +139,12 @@ async def test_sse_emits_mcp_endpoint_event(monkeypatch, tmp_path):
         await _stop(server, task)
 
 
-@pytest.mark.asyncio
-async def test_messages_endpoint_is_mounted(monkeypatch, tmp_path):
-    """A POST to /messages/ must reach the SSE transport, not FastAPI's default 404.
-
-    The transport will reject our made-up session_id with its own 404 (logged
-    as "Could not find session for ID: ..."), and that's fine — we just need
-    to prove the mount is wired. A FastAPI default `{"detail":"Not Found"}`
-    body means `app.mount("/messages/", _messages_asgi)` is missing or
-    misrouted.
-    """
-    server, task, port = await _start_app(monkeypatch, tmp_path)
-    try:
-        async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
-            response = await client.post(
-                f"http://127.0.0.1:{port}/messages/?session_id=00000000-0000-0000-0000-000000000000",
-                json={"jsonrpc": "2.0", "method": "ping", "id": 1},
-            )
-
-        # FastAPI's default 404 ships `application/json` with `{"detail":"Not
-        # Found"}`. The SSE transport's "unknown session" 404 ships a different
-        # shape (text/plain, no `detail` key). Asserting on shape rather than
-        # byte-equality keeps this robust against starlette tweaking spacing
-        # in its default JSON serializer.
-        ct = response.headers.get("content-type", "")
-        # Guard `.json()` — a future regression could return JSON content-type
-        # with an empty body, which would otherwise blow up the assert with a
-        # JSONDecodeError instead of a meaningful test failure.
-        detail = None
-        if response.content and "application/json" in ct:
-            try:
-                detail = response.json().get("detail")
-            except ValueError:
-                detail = None
-        is_fastapi_default_404 = (
-            response.status_code == 404
-            and "application/json" in ct
-            and detail == "Not Found"
-        )
-        assert not is_fastapi_default_404, (
-            f"/messages/ returned FastAPI's default 404, so the mount is "
-            f"missing. Status={response.status_code} content-type={ct!r} "
-            f"body={response.text!r}"
-        )
-    finally:
-        await _stop(server, task)
+# `test_messages_endpoint_is_mounted` used to live here. It probed /messages/
+# with a fabricated session_id, which now short-circuits in `_messages_asgi`'s
+# unknown-owner branch (404 from our own guard) and never reaches the SDK
+# transport — so it stopped proving anything about the mount itself.
+# The replacement lives in tests/test_auth.py as
+# `test_messages_routes_to_transport_for_real_session`: it opens a real SSE
+# session, captures the issued session_id from the endpoint event, and POSTs
+# with that same session_id and matching credentials. Anything other than
+# 202 from the SDK transport means the binding or mount broke.
